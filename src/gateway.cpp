@@ -1,63 +1,83 @@
-#include "gateway.h"
 #include <Arduino.h>
 #include <SPI.h>
 #include <Ethernet.h>
-#include <ArduinoJson.h>
+#include "e220.h"
 
-#define SCK 12
-#define MISO 13
-#define MOSI 11
-#define CS 10
+#define ETH_SCK 12
+#define ETH_MISO 13
+#define ETH_MOSI 11
+#define ETH_CS 10
 
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+EthernetClient client;
 
-struct __attribute__((packed)) DataDevicePJU {
-  char id[10];
-  bool state;
-  uint16_t vin;
-  uint16_t crc;
-};
+const char* serverHost = "log.pcbjogja.com";
+const char* serverPath = "/test.php";
 
-DataDevicePJU device;
+IPAddress ip(192, 168, 1, 177);
+IPAddress dns(8, 8, 8, 8);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
 
 void setupGateway() {
-  SPI.begin(SCK, MISO, MOSI, CS);
+    Serial.begin(115200);
 
-  Serial.println("Starting Ethernet...");
+    SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
+    Ethernet.init(ETH_CS);
 
-  if (Ethernet.begin(mac) == 0) {
-    Serial.println("❌ DHCP gagal");
-  } else {
-    Serial.println("✅ Ethernet Connected");
-    Serial.print("IP: ");
-    Serial.println(Ethernet.localIP());
-  }
+    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
+        while (true) {
+            delay(1);
+        }
+    }
+
+    if (Ethernet.begin(mac) == 0) {
+        Ethernet.begin(mac, ip, dns, gateway, subnet);
+    }
+
+    delay(2000);
+    setupE220();
 }
 
 void loopGateway() {
-  if (Serial.available()) {
+    char buffer[200];
 
-    String json = Serial.readStringUntil('\n');
+    if (receiveData(buffer, sizeof(buffer))) {
+        Serial.print("Data: ");
+        Serial.println(buffer);
 
-    Serial.println("\nRAW:");
-    Serial.println(json);
+        if (client.connect(serverHost, 80)) {
+            String postData = "data=" + String(buffer);
 
-    StaticJsonDocument<200> doc;
-    DeserializationError error = deserializeJson(doc, json);
+            client.print("POST ");
+            client.print(serverPath);
+            client.println(" HTTP/1.1");
+            
+            client.print("Host: ");
+            client.println(serverHost);
+            
+            client.println("Content-Type: application/x-www-form-urlencoded");
+            client.print("Content-Length: ");
+            client.println(postData.length());
+            client.println("Connection: close");
+            client.println();
+            client.print(postData);
 
-    if (!error) {
-      strcpy(device.id, doc["id"]);
-      device.state = doc["state"];
-      device.vin = doc["vin"];
-      device.crc = doc["crc"];
+            unsigned long timeout = millis();
+            while (client.available() == 0) {
+                if (millis() - timeout > 5000) {
+                    client.stop();
+                    return;
+                }
+            }
 
-      Serial.println("\nPARSED:");
-      Serial.print("ID: "); Serial.println(device.id);
-      Serial.print("STATE: "); Serial.println(device.state);
-      Serial.print("VIN: "); Serial.println(device.vin);
-      Serial.print("CRC: "); Serial.println(device.crc);
-    } else {
-      Serial.println("JSON ERROR");
+            while (client.available()) {
+                char c = client.read();
+                Serial.print(c);
+            }
+            client.stop();
+        } else {
+            Serial.println("Koneksi Gagal. Cek Kabel Internet/Gateway!");
+        }
     }
-  }
 }

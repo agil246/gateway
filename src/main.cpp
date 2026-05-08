@@ -1,5 +1,7 @@
-#include <Arduino.h>   // WAJIB
-#include "gateway.h"
+#include <Arduino.h>
+
+void setupGateway();
+void loopGateway();
 
 void setup() {
   Serial.begin(115200);
