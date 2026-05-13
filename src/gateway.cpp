@@ -1,83 +1,151 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Ethernet.h>
-#include "e220.h"
+#include "LoRa_E220.h"
 
-#define ETH_SCK 12
-#define ETH_MISO 13
-#define ETH_MOSI 11
-#define ETH_CS 10
+#define ETH_SCK  36
+#define ETH_MISO 37
+#define ETH_MOSI 35
+#define ETH_CS   10
+#define LORA_AUX 15
+#define LORA_M0  4
+#define LORA_M1  5
+#define LORA_RX  16
+#define LORA_TX  17
 
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-EthernetClient client;
+char server[] = "httpbin.org";
+String path = "/post";
 
-const char* serverHost = "log.pcbjogja.com";
-const char* serverPath = "/test.php";
+struct __attribute__((packed)) DataDevicePJU {
+    char id[10];
+    bool state;
+    uint16_t vin;
+    uint16_t crc;
+};
 
-IPAddress ip(192, 168, 1, 177);
-IPAddress dns(8, 8, 8, 8);
-IPAddress gateway(192, 168, 1, 1);
-IPAddress subnet(255, 255, 255, 0);
+LoRa_E220 e220(&Serial2, LORA_AUX, LORA_M0, LORA_M1);
+EthernetClient ethClient;
 
-void setupGateway() {
+uint16_t calculateCRC(uint16_t vin, bool state) {
+    return vin ^ (state ? 0x4398 : 0x1234);
+}
+
+void postToServer(String json) {
+    if (ethClient.connect(server, 80)) {
+        ethClient.println("POST " + path + " HTTP/1.1");
+        ethClient.println("Host: " + String(server));
+        ethClient.println("Content-Type: application/json");
+        ethClient.print("Content-Length: ");
+        ethClient.println(json.length());
+        ethClient.println();
+        ethClient.print(json);
+
+        uint32_t timeout = millis();
+        while (ethClient.connected() && millis() - timeout < 2000) {
+            if (ethClient.available()) {
+                char c = ethClient.read();
+                Serial.print(c);
+                timeout = millis();
+            }
+        }
+        ethClient.stop();
+        Serial.println("\n[Gateway] Data Uploaded");
+    } else {
+        Serial.println("[Gateway] Connection Failed");
+    }
+}
+
+void sendData() {
+    DataDevicePJU data;
+    strncpy(data.id, "PJU001", 10);
+    data.state = true;
+    data.vin = 220;
+    data.crc = calculateCRC(data.vin, data.state);
+
+    Serial.println("[Gateway] Sending data...");
+    Serial.print("ID: ");    Serial.println(data.id);
+    Serial.print("State: "); Serial.println(data.state ? "ON" : "OFF");
+    Serial.print("Vin: ");   Serial.println(data.vin);
+    Serial.print("CRC: ");   Serial.println(data.crc);
+
+    String jsonBody = "{";
+    jsonBody += "\"id\":\"" + String(data.id) + "\",";
+    jsonBody += "\"state\":" + String(data.state ? "true" : "false") + ",";
+    jsonBody += "\"vin\":" + String(data.vin) + ",";
+    jsonBody += "\"crc\":" + String(data.crc);
+    jsonBody += "}";
+
+    postToServer(jsonBody);
+}
+
+void setup() {
     Serial.begin(115200);
+    delay(1000);
+
+    pinMode(36, OUTPUT);
+    pinMode(37, OUTPUT);
 
     SPI.begin(ETH_SCK, ETH_MISO, ETH_MOSI, ETH_CS);
     Ethernet.init(ETH_CS);
 
-    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
-        while (true) {
-            delay(1);
-        }
+    Serial.println("Mencoba DHCP...");
+    int dhcpRetry = 0;
+    while (Ethernet.begin(mac) == 0 && dhcpRetry < 3) {
+        Serial.println("Retry DHCP...");
+        delay(2000);
+        dhcpRetry++;
     }
-
-    if (Ethernet.begin(mac) == 0) {
-        Ethernet.begin(mac, ip, dns, gateway, subnet);
+    if (Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
+        Serial.println("[Gateway] DHCP Failed, pakai static IP");
+        Ethernet.begin(mac, IPAddress(192, 168, 1, 100));
     }
+    Serial.print("[Gateway] IP: ");
+    Serial.println(Ethernet.localIP());
 
-    delay(2000);
-    setupE220();
+    Serial2.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
+    e220.begin();
+
+    ResponseStructContainer c = e220.getConfiguration();
+    Configuration config = *(Configuration*) c.data;
+    Serial.print("[LoRa] Channel: "); Serial.println(config.CHAN);
+    Serial.print("[LoRa] ADDH: ");    Serial.println(config.ADDH);
+    Serial.print("[LoRa] ADDL: ");    Serial.println(config.ADDL);
+    c.close();
+
+    Serial.println("[Gateway] Ready");
 }
 
-void loopGateway() {
-    char buffer[200];
+void loop() {
+    if (e220.available() > 0 || Serial2.available() > 0) {
+        Serial.println("\n[LoRa] Data diterima!");
+        ResponseStructContainer rsc = e220.receiveMessage(sizeof(DataDevicePJU));
+        struct DataDevicePJU* rxData = (struct DataDevicePJU*) rsc.data;
 
-    if (receiveData(buffer, sizeof(buffer))) {
-        Serial.print("Data: ");
-        Serial.println(buffer);
-
-        if (client.connect(serverHost, 80)) {
-            String postData = "data=" + String(buffer);
-
-            client.print("POST ");
-            client.print(serverPath);
-            client.println(" HTTP/1.1");
-            
-            client.print("Host: ");
-            client.println(serverHost);
-            
-            client.println("Content-Type: application/x-www-form-urlencoded");
-            client.print("Content-Length: ");
-            client.println(postData.length());
-            client.println("Connection: close");
-            client.println();
-            client.print(postData);
-
-            unsigned long timeout = millis();
-            while (client.available() == 0) {
-                if (millis() - timeout > 5000) {
-                    client.stop();
-                    return;
-                }
+        if (rsc.status.code == 1) {
+            uint16_t checkCRC = calculateCRC(rxData->vin, rxData->state);
+            if (checkCRC == rxData->crc) {
+                Serial.println("[Gateway] Valid Packet Received");
+                String jsonBody = "{";
+                jsonBody += "\"id\":\"" + String(rxData->id) + "\",";
+                jsonBody += "\"state\":" + String(rxData->state ? "true" : "false") + ",";
+                jsonBody += "\"vin\":" + String(rxData->vin) + ",";
+                jsonBody += "\"crc\":" + String(rxData->crc);
+                jsonBody += "}";
+                postToServer(jsonBody);
+            } else {
+                Serial.print("[Gateway] CRC Error - Received: ");
+                Serial.print(rxData->crc);
+                Serial.print(" Expected: ");
+                Serial.println(checkCRC);
             }
-
-            while (client.available()) {
-                char c = client.read();
-                Serial.print(c);
-            }
-            client.stop();
-        } else {
-            Serial.println("Koneksi Gagal. Cek Kabel Internet/Gateway!");
         }
+        rsc.close();
+    }
+
+    static uint32_t lastSend = 0;
+    if (millis() - lastSend >= 10000) {
+        lastSend = millis();
+        sendData();
     }
 }
